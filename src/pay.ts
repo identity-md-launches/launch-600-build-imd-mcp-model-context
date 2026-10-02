@@ -8,7 +8,6 @@ import {
   PERMIT2,
   SpendTracker,
   X402_SPENDER,
-  parseImdAmount,
 } from "./config.js";
 import { Capabilities, Challenge, ImdClient } from "./api.js";
 import { asHex32, eqAddress, paymentHashOf, randomNonce, toEpochSeconds } from "./util.js";
@@ -76,11 +75,27 @@ export interface PayResult {
 }
 
 /**
- * Verify a 402 challenge against capabilities and its own quote.
- * Refuses (throws PaymentRefusal) on any mismatch — this is what blocks
- * look-alike asset/payTo poisoning and over-quotes.
+ * The amount capabilities allow for one quote: payment.amount, times the
+ * request's runs when the action is priced per run (schedule.create/topup).
  */
-export function verifyChallenge(challenge: Challenge, caps: Capabilities): VerifiedPayment {
+export function expectedAmountWei(caps: Capabilities, action: string, input: unknown): bigint {
+  const unitWei = BigInt(caps.actions[action]?.amount ?? "0");
+  const per = caps.pricedPer[action];
+  if (per === undefined) return unitWei;
+  if (per !== "run") throw new PaymentRefusal(`action ${action} is priced per "${per}", which is not supported`);
+  const runs = (input as { runs?: unknown } | null | undefined)?.runs;
+  if (typeof runs !== "number" || !Number.isSafeInteger(runs) || runs <= 0) {
+    throw new PaymentRefusal(`action ${action} is priced per run but the quoted input has no positive integer runs`);
+  }
+  return unitWei * BigInt(runs);
+}
+
+/**
+ * Verify a 402 challenge against the capabilities entry for the quoted action
+ * and against its own quote. Refuses (throws PaymentRefusal) on any mismatch —
+ * this is what blocks look-alike asset/payTo poisoning and over-quotes.
+ */
+export function verifyChallenge(challenge: Challenge, capabilities: Capabilities): VerifiedPayment {
   if (!challenge.accepts.length) {
     throw new PaymentRefusal("challenge contains no accepts[] entries");
   }
@@ -91,12 +106,20 @@ export function verifyChallenge(challenge: Challenge, caps: Capabilities): Verif
   if (!quote.id || !quote.quoteHash || !quote.action) {
     throw new PaymentRefusal("challenge quote is missing id, quoteHash or action");
   }
+  const caps = capabilities.actions[quote.action];
+  if (!caps) {
+    throw new PaymentRefusal(`capabilities has no payment entry for action ${quote.action}`);
+  }
   for (const [field, v] of [
-    ["capabilities.asset", caps.asset],
-    ["capabilities.payTo", caps.payTo],
-    ["capabilities.price", caps.price],
+    ["asset", caps.asset],
+    ["payTo", caps.payTo],
+    ["amount", caps.amount],
   ] as const) {
-    if (!v) throw new PaymentRefusal(`${field} is missing — cannot verify the challenge`);
+    if (!v) {
+      throw new PaymentRefusal(
+        `capabilities ${quote.action} payment.${field} is missing — cannot verify the challenge`,
+      );
+    }
   }
 
   // --- asset: challenge + quote + capabilities must all be the real IMD token ---
@@ -130,7 +153,7 @@ export function verifyChallenge(challenge: Challenge, caps: Capabilities): Verif
     );
   }
 
-  // --- amount: identical everywhere, and never more than the standard price ---
+  // --- amount: identical everywhere, and exactly the capabilities price (x runs) ---
   let amountWei: bigint;
   try {
     amountWei = BigInt(payment.amount);
@@ -144,10 +167,17 @@ export function verifyChallenge(challenge: Challenge, caps: Capabilities): Verif
       `accepts[0].amount ${String(accept.amount)} differs from the quoted amount ${payment.amount}`,
     );
   }
-  const capPriceWei = parseImdAmount(caps.price, caps.price ?? "0");
+  let capPriceWei: bigint;
+  try {
+    capPriceWei = expectedAmountWei(capabilities, quote.action, challenge.input);
+  } catch (e) {
+    if (e instanceof PaymentRefusal) throw e;
+    throw new PaymentRefusal(`capabilities ${quote.action} payment.amount ${caps.amount} is not an integer`);
+  }
   if (amountWei !== capPriceWei) {
     throw new PaymentRefusal(
-      `quoted amount ${payment.amount} differs from capabilities price ${caps.price}`,
+      `quoted amount ${payment.amount} differs from capabilities price ${capPriceWei.toString(10)} ` +
+        `(${quote.action} payment.amount ${caps.amount}${capabilities.pricedPer[quote.action] ? " per run" : ""})`,
     );
   }
 

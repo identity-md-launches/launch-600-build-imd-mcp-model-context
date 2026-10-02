@@ -20,18 +20,27 @@ export class ApiError extends Error {
 export interface ActionSpec {
   name: string;
   description?: string;
-  /** JSON schema for the action's input object (draft-07-ish), if advertised. */
+  /** JSON schema for the action's input object, if advertised (the live API advertises none). */
   inputSchema?: Record<string, unknown>;
   raw: unknown;
 }
 
-export interface Capabilities {
+/** One action's payment terms from GET /requests/capabilities actions[]. */
+export interface ActionPayment {
+  network?: string;
   asset?: string;
+  /** Price of one unit in wei (integer string). */
+  amount?: string;
   payTo?: string;
-  /** Price per action; may be wei integer or decimal IMD string. */
-  price?: string;
-  quoteLifetimeSeconds?: number;
-  launchChains?: string[];
+  decimals?: number;
+  quoteTtlSeconds?: number;
+}
+
+export interface Capabilities {
+  /** Payment terms keyed by action name. There is no top-level asset/payTo/price. */
+  actions: Record<string, ActionPayment>;
+  /** action -> unit, e.g. { "schedule.create": "run" }: amount is charged once per unit. */
+  pricedPer: Record<string, string>;
   raw: unknown;
 }
 
@@ -47,6 +56,8 @@ export interface Challenge {
   resource: unknown;
   resourceUrl: string;
   requesterScopeHash: string;
+  /** The exact prepared input saved with the quote (e.g. schedule runs). */
+  input: unknown;
   raw: Record<string, unknown>;
 }
 
@@ -92,19 +103,11 @@ export class ImdClient {
     return { status: res.status, json, text };
   }
 
-  /** GET /requests/capabilities — price, asset, payTo, quote lifetime, launch chains. */
+  /** GET /requests/capabilities — per-action price, asset, payTo and quote lifetime. */
   async capabilities(force = false): Promise<Capabilities> {
     if (this.capabilitiesCache && !force) return this.capabilitiesCache;
     const { json } = await this.request("GET", "/requests/capabilities");
-    const o = (json ?? {}) as Record<string, unknown>;
-    this.capabilitiesCache = {
-      asset: str(o.asset) ?? str(o.paymentAsset),
-      payTo: str(o.payTo) ?? str(o.pay_to),
-      price: str(o.price) ?? str(o.priceWei) ?? str(o.amount),
-      quoteLifetimeSeconds: num(o.quoteLifetimeSeconds) ?? num(o.quoteTtlSeconds),
-      launchChains: Array.isArray(o.launchChains) ? (o.launchChains as string[]) : undefined,
-      raw: json,
-    };
+    this.capabilitiesCache = parseCapabilities(json);
     return this.capabilitiesCache;
   }
 
@@ -193,6 +196,7 @@ export class ImdClient {
       resource: o.resource,
       resourceUrl: str(o.resourceUrl) ?? str(o.resource_url) ?? "",
       requesterScopeHash: str(o.requesterScopeHash) ?? str(o.requester_scope_hash) ?? "",
+      input: o.input,
       raw: o,
     };
     return challenge;
@@ -257,10 +261,40 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v !== 
 const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
 
 /**
- * Normalise the x-imd-actions extension. Accepts a map of name -> spec,
- * { actions: { name -> spec } }, or an array of { name|id, ... }.
+ * Parse GET /requests/capabilities: { actions: [{ action, version, payment:
+ * { network, asset, amount, payTo, decimals }, quoteTtlSeconds }], pricedPer, ... }.
  */
-function normaliseActions(x: unknown): Record<string, ActionSpec> {
+export function parseCapabilities(json: unknown): Capabilities {
+  const o = (json ?? {}) as Record<string, unknown>;
+  const actions: Record<string, ActionPayment> = {};
+  for (const item of Array.isArray(o.actions) ? o.actions : []) {
+    const a = (item ?? {}) as Record<string, unknown>;
+    const name = str(a.action);
+    if (!name) continue;
+    const p = (a.payment ?? {}) as Record<string, unknown>;
+    actions[name] = {
+      network: str(p.network),
+      asset: str(p.asset),
+      amount: str(p.amount),
+      payTo: str(p.payTo),
+      decimals: num(p.decimals),
+      quoteTtlSeconds: num(a.quoteTtlSeconds),
+    };
+  }
+  const pricedPer: Record<string, string> = {};
+  if (o.pricedPer && typeof o.pricedPer === "object") {
+    for (const [name, unit] of Object.entries(o.pricedPer as Record<string, unknown>)) {
+      if (str(unit)) pricedPer[name] = unit as string;
+    }
+  }
+  return { actions, pricedPer, raw: json };
+}
+
+/**
+ * Normalise the x-imd-actions extension: an array of
+ * { action, version, payment, quoteTtlSeconds, limits }, keyed by .action.
+ */
+export function normaliseActions(x: unknown): Record<string, ActionSpec> {
   const out: Record<string, ActionSpec> = {};
   const fromEntry = (name: string, spec: unknown) => {
     const s = (spec ?? {}) as Record<string, unknown>;
@@ -278,18 +312,8 @@ function normaliseActions(x: unknown): Record<string, ActionSpec> {
   };
   if (Array.isArray(x)) {
     for (const item of x) {
-      const name = str((item as Record<string, unknown>).name) ?? str((item as Record<string, unknown>).id);
+      const name = str((item as Record<string, unknown> | null)?.action);
       if (name) fromEntry(name, item);
-    }
-    return out;
-  }
-  if (x && typeof x === "object") {
-    const map =
-      (x as Record<string, unknown>).actions && typeof (x as Record<string, unknown>).actions === "object"
-        ? ((x as Record<string, unknown>).actions as Record<string, unknown>)
-        : (x as Record<string, unknown>);
-    for (const [name, spec] of Object.entries(map)) {
-      if (spec && typeof spec === "object") fromEntry(name, spec);
     }
   }
   return out;

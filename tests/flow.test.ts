@@ -13,6 +13,7 @@ import {
   MOCK_PAYTO,
   MOCK_PRICE_WEI,
   MockServer,
+  liveFixture,
   startMock,
 } from "./mock-server.js";
 import {
@@ -23,7 +24,7 @@ import {
   resultText,
 } from "./helpers.js";
 
-const QUOTE_INPUT = { repoUrl: "https://github.com/example/repo", prompt: "fix the tests" };
+const QUOTE_INPUT = liveFixture("check-job.open.request.json").input;
 
 let mock: MockServer;
 before(async () => {
@@ -38,7 +39,7 @@ describe("full paid-request path", () => {
     const ctx = makeCtx(mock);
     const handlers = handlersOf(ctx);
 
-    const quoteRes = await handlers.imd_quote({ action: "swarm.launch", input: QUOTE_INPUT });
+    const quoteRes = await handlers.imd_quote({ action: "job.open", input: QUOTE_INPUT });
     assert.equal(quoteRes.isError, undefined, resultText(quoteRes));
     const quote = resultJson<{ orderId: string; quote: { payment: { amount: string; payTo: string; asset: string } } }>(quoteRes);
     assert.ok(quote.orderId.startsWith("ord_"));
@@ -165,7 +166,7 @@ describe("full paid-request path", () => {
 
   it("records spend against the per-day tracker", async () => {
     const ctx = makeCtx(mock);
-    const orderId = await ctx.client.quote("swarm.launch", QUOTE_INPUT);
+    const orderId = await ctx.client.quote("job.open", QUOTE_INPUT);
     await payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId, { intervalMs: 5 });
     assert.equal(ctx.tracker.spentToday(), BigInt(MOCK_PRICE_WEI));
   });
@@ -194,11 +195,11 @@ describe("full paid-request path", () => {
     const caps = await client.callTool({ name: "imd_capabilities", arguments: {} });
     const capsJson = JSON.parse((caps.content as any)[0].text);
     assert.equal(capsJson.dryRun, true);
-    assert.ok(capsJson.actions["swarm.launch"]);
+    assert.ok(capsJson.actions["job.open"]);
 
     const quote = await client.callTool({
       name: "imd_quote",
-      arguments: { action: "swarm.launch", input: QUOTE_INPUT },
+      arguments: { action: "job.open", input: QUOTE_INPUT },
     });
     const orderId = JSON.parse((quote.content as any)[0].text).orderId;
     assert.ok(orderId);

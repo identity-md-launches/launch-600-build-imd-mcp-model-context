@@ -1,15 +1,36 @@
 import http from "node:http";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 
 /**
  * Local mock of https://api.imd.fun for tests. Never spends real IMD,
  * never touches mainnet — it just speaks the wire protocol.
+ *
+ * GET /requests/capabilities, GET /openapi.json and POST /requests/check are
+ * served from bodies saved from the live API under fixtures/live/.
  */
 
-export const MOCK_ASSET = "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"; // IMD
-export const MOCK_PAYTO = "0x9cA70B93CaE5576645F5F069524A9B9c3aef5006";
-export const MOCK_PRICE_WEI = "500000000000000000"; // 0.5 IMD
+/** Read a body saved from the live API (fixtures/live/, resolved from the compiled dist/tests/). */
+export function liveFixture<T = any>(name: string): T {
+  return JSON.parse(readFileSync(new URL(`../../fixtures/live/${name}`, import.meta.url), "utf8")) as T;
+}
+
+export const LIVE_CAPABILITIES = liveFixture<{
+  actions: { action: string; payment: Record<string, unknown> }[];
+  pricedPer: Record<string, string>;
+}>("capabilities.json");
+export const LIVE_OPENAPI = liveFixture<{ "x-imd-actions": { action: string }[] }>("openapi.json");
+const LIVE_ACTIONS = LIVE_OPENAPI["x-imd-actions"].map((a) => a.action);
+const LIVE_CHECKS: Record<string, unknown> = {
+  "job.open": liveFixture("check-job.open.response.json"),
+  "schedule.create": liveFixture("check-schedule.create.response.json"),
+};
+const JOB_OPEN = LIVE_CAPABILITIES.actions.find((a) => a.action === "job.open")!.payment;
+
+export const MOCK_ASSET = JOB_OPEN.asset as string; // IMD
+export const MOCK_PAYTO = JOB_OPEN.payTo as string;
+export const MOCK_PRICE_WEI = JOB_OPEN.amount as string; // 0.5 IMD
 
 export interface ChallengeOverrides {
   asset?: string;
@@ -61,33 +82,26 @@ export interface MockServer {
   close(): Promise<void>;
 }
 
-const ACTIONS = {
-  "swarm.launch": {
-    description: "Hire the swarm on a repository task",
-    inputSchema: {
-      type: "object",
-      properties: {
-        repoUrl: { type: "string" },
-        prompt: { type: "string" },
-      },
-      required: ["repoUrl", "prompt"],
-      additionalProperties: false,
-    },
-  },
-  "schedule.create": {
-    description: "Create a recurring swarm run",
-    inputSchema: {
-      type: "object",
-      properties: {
-        repoUrl: { type: "string" },
-        prompt: { type: "string" },
-        cron: { type: "string" },
-      },
-      required: ["repoUrl", "prompt", "cron"],
-      additionalProperties: false,
-    },
-  },
-};
+/** Live price: the action's payment.amount, times input.runs when priced per run. */
+function liveAmount(action: string, input: unknown): string {
+  const unit = BigInt(String(LIVE_CAPABILITIES.actions.find((a) => a.action === action)?.payment.amount ?? MOCK_PRICE_WEI));
+  if (LIVE_CAPABILITIES.pricedPer[action] !== "run") return unit.toString(10);
+  return (unit * BigInt((input as { runs: number }).runs)).toString(10);
+}
+
+/** The checks the live quote applies that the tests exercise (422 problems). */
+function inputProblems(action: string, input: unknown): string[] {
+  const o = (input ?? {}) as Record<string, unknown>;
+  if (action === "job.open" && typeof o.objective !== "string") {
+    return ["objective: Invalid input: expected string, received undefined"];
+  }
+  if (["schedule.create", "schedule.topup"].includes(action)) {
+    if (typeof o.runs !== "number" || !Number.isSafeInteger(o.runs) || o.runs < 1) {
+      return ["runs: Invalid input: expected a positive integer"];
+    }
+  }
+  return [];
+}
 
 export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
   const orders = new Map<string, Order>();
@@ -115,11 +129,13 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
 
   const challenge = (orderId: string) => {
     const ov = opts.challenge ?? {};
+    const order = orders.get(orderId)!;
     const asset = ov.asset ?? MOCK_ASSET;
     const payTo = ov.payTo ?? MOCK_PAYTO;
-    const amount = ov.amount ?? MOCK_PRICE_WEI;
+    const amount = ov.amount ?? liveAmount(order.action, order.input);
     const expiresAt = new Date(Date.now() + 300_000).toISOString();
     return {
+      x402Version: 2,
       accepts: [
         {
           scheme: ov.scheme ?? "exact",
@@ -133,13 +149,14 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
       quote: {
         id: `q_${orderId}`,
         quoteHash: randomBytes(32).toString("hex"),
-        action: orders.get(orderId)?.action ?? "swarm.launch",
+        action: order.action,
         payment: { asset, amount, payTo },
         expiresAt,
       },
       resource: `imd:requests/${orderId}`,
       resourceUrl: `https://api.imd.fun/requests/${orderId}`,
       requesterScopeHash: randomBytes(32).toString("hex"),
+      input: order.input,
     };
   };
 
@@ -151,22 +168,17 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
 
     try {
       if (req.method === "GET" && path === "/openapi.json") {
-        return send(res, 200, {
-          openapi: "3.1.0",
-          info: { title: "IMD API (mock)", version: "0.0.0" },
-          paths: {},
-          "x-imd-actions": ACTIONS,
-        });
+        return send(res, 200, LIVE_OPENAPI);
       }
 
       if (req.method === "GET" && path === "/requests/capabilities") {
-        return send(res, 200, {
-          asset: opts.capabilitiesAsset ?? MOCK_ASSET,
-          payTo: opts.capabilitiesPayTo ?? MOCK_PAYTO,
-          price: opts.capabilitiesPrice ?? MOCK_PRICE_WEI,
-          quoteLifetimeSeconds: 300,
-          launchChains: ["ethereum", "base"],
-        });
+        const caps = structuredClone(LIVE_CAPABILITIES);
+        for (const a of caps.actions) {
+          if (opts.capabilitiesAsset) a.payment.asset = opts.capabilitiesAsset;
+          if (opts.capabilitiesPayTo) a.payment.payTo = opts.capabilitiesPayTo;
+          if (opts.capabilitiesPrice) a.payment.amount = opts.capabilitiesPrice;
+        }
+        return send(res, 200, caps);
       }
 
       if (req.method === "POST" && path === "/requests/check") {
@@ -175,7 +187,8 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
           checkFailsLeft--;
           return send(res, 503, { error: "evaluator unavailable" });
         }
-        return send(res, 200, { verdict: "pass", problems: [] });
+        const body = JSON.parse(await readBody(req) || "{}");
+        return send(res, 200, LIVE_CHECKS[body.action] ?? { action: body.action, blockers: [], suggestions: [] });
       }
 
       if (req.method === "POST" && path === "/requests/import") {
@@ -193,12 +206,14 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
         if (typeof body.requestKey !== "string" || !body.requestKey) {
           return send(res, 422, { error: "invalid_input", problems: ["requestKey required"] });
         }
-        if (!(body.action in ACTIONS)) {
+        if (!LIVE_ACTIONS.includes(body.action)) {
           return send(res, 422, {
             error: "invalid_input",
             problems: [`unknown action ${String(body.action)}`],
           });
         }
+        const problems = inputProblems(body.action, body.input);
+        if (problems.length) return send(res, 422, { error: "invalid_input", problems });
         const id = `ord_${++orderSeq}`;
         orders.set(id, {
           id,
@@ -209,7 +224,7 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
           paid: false,
           polls: 0,
         });
-        return send(res, 201, { order: { id } });
+        return send(res, 201, { created: true, order: { id } });
       }
 
       const submitMatch = path.match(/^\/requests\/([^/]+)\/submit$/);
@@ -295,7 +310,7 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
         const owner = url.searchParams.get("owner") ?? "";
         return send(res, 200, {
           schedules: [
-            { id: "sched_1", owner, action: "swarm.launch", cron: "0 9 * * 1" },
+            { id: "sched_1", owner, action: "job.open", cron: "0 9 * * 1" },
           ],
         });
       }

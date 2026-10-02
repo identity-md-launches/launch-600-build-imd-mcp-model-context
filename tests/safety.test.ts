@@ -7,14 +7,14 @@ import { parseUnits } from "viem";
 import { ImdClient } from "../src/api.js";
 import { SpendTracker, loadConfig } from "../src/config.js";
 import { payOrder } from "../src/pay.js";
-import { MOCK_PRICE_WEI, startMock } from "./mock-server.js";
+import { MOCK_PRICE_WEI, liveFixture, startMock } from "./mock-server.js";
 import { TEST_ADDRESS, TEST_KEY, handlersOf, makeCtx, resultJson, resultText } from "./helpers.js";
 
-const INPUT = { repoUrl: "https://github.com/example/repo", prompt: "fix the tests" };
+const INPUT = liveFixture("check-job.open.request.json").input;
 const EVIL = "0x000000000000000000000000000000000000dEaD";
 
 async function quote(handlers: ReturnType<typeof handlersOf>): Promise<string> {
-  const res = await handlers.imd_quote({ action: "swarm.launch", input: INPUT });
+  const res = await handlers.imd_quote({ action: "job.open", input: INPUT });
   return resultJson<{ orderId: string }>(res).orderId;
 }
 
@@ -186,12 +186,12 @@ describe("safety", () => {
     const mock = await startMock({ pendingPolls: 0, dropFirstPaymentResponse: true });
     try {
       const ctx = makeCtx(mock, { maxPerRequestWei: BigInt(MOCK_PRICE_WEI), maxPerDayWei: BigInt(MOCK_PRICE_WEI) });
-      const first = await ctx.client.quote("swarm.launch", INPUT);
+      const first = await ctx.client.quote("job.open", INPUT);
       await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, first, { intervalMs: 1, timeoutMs: 50 }));
       assert.equal(mock.submissions.length, 1, "the mock accepted the authorization before disconnecting");
       assert.equal(ctx.tracker.spentToday(), BigInt(MOCK_PRICE_WEI));
 
-      const second = await ctx.client.quote("swarm.launch", INPUT);
+      const second = await ctx.client.quote("job.open", INPUT);
       await assert.rejects(
         () => payOrder(ctx.client, ctx.cfg, ctx.tracker, second, { intervalMs: 1, timeoutMs: 50 }),
         /per-day cap/,
@@ -206,7 +206,7 @@ describe("safety", () => {
     const mock = await startMock({ pendingPolls: 10_000 });
     try {
       const ctx = makeCtx(mock);
-      const orderId = await ctx.client.quote("swarm.launch", INPUT);
+      const orderId = await ctx.client.quote("job.open", INPUT);
       await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId, { intervalMs: 1, timeoutMs: 10 }));
       assert.equal(mock.submissions.length, 1);
       await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId, { intervalMs: 1, timeoutMs: 10 }));
@@ -224,13 +224,13 @@ describe("safety", () => {
       const cfg = makeCtx(mock, { maxPerRequestWei: cap, maxPerDayWei: cap }).cfg;
       const firstClient = new ImdClient(mock.url);
       const firstTracker = new SpendTracker({ wallet: TEST_ADDRESS, storageDir: stateDir });
-      const first = await firstClient.quote("swarm.launch", INPUT);
+      const first = await firstClient.quote("job.open", INPUT);
       await payOrder(firstClient, cfg, firstTracker, first, { intervalMs: 1, timeoutMs: 100 });
 
       const secondClient = new ImdClient(mock.url);
       const secondTracker = new SpendTracker({ wallet: TEST_ADDRESS, storageDir: stateDir });
       assert.equal(secondTracker.spentToday(), cap, "new tracker reads the same wallet ledger");
-      const second = await secondClient.quote("swarm.launch", INPUT);
+      const second = await secondClient.quote("job.open", INPUT);
       await assert.rejects(
         () => payOrder(secondClient, cfg, secondTracker, second, { intervalMs: 1, timeoutMs: 100 }),
         /per-day cap/,
@@ -256,7 +256,7 @@ describe("safety", () => {
     const mock = await startMock({ checkFailures: 2 });
     try {
       const handlers = handlersOf(makeCtx(mock));
-      const res = await handlers.imd_check({ action: "swarm.launch", input: INPUT });
+      const res = await handlers.imd_check({ action: "job.open", input: INPUT });
       assert.equal(res.isError, undefined, resultText(res));
       assert.equal(mock.checkCalls, 3);
     } finally {
@@ -268,7 +268,7 @@ describe("safety", () => {
     const mock = await startMock({ checkFailures: 10 });
     try {
       const handlers = handlersOf(makeCtx(mock));
-      const res = await handlers.imd_check({ action: "swarm.launch", input: INPUT });
+      const res = await handlers.imd_check({ action: "job.open", input: INPUT });
       assert.equal(res.isError, true);
       assert.equal(mock.checkCalls, 3);
     } finally {
@@ -288,13 +288,14 @@ describe("safety", () => {
     }
   });
 
-  it("validates action input against the advertised schema", async () => {
+  it("passes input through and surfaces the server's 422 problems", async () => {
     const mock = await startMock();
     try {
       const handlers = handlersOf(makeCtx(mock));
-      const res = await handlers.imd_quote({ action: "swarm.launch", input: { prompt: "x" } });
+      const res = await handlers.imd_quote({ action: "job.open", input: { prompt: "x" } });
       assert.equal(res.isError, true);
-      assert.match(resultText(res), /schema/);
+      assert.match(resultText(res), /invalid_input.*objective/);
+      assert.match(resultText(res), /imd_check/);
     } finally {
       await mock.close();
     }

@@ -1,0 +1,1 @@
+{"action":"job.open","input":{"objective":"Write a sourced report comparing three approaches to deterministic EVM testing.","skill":"research-report","outputs":[{"name":"report","path":"artifacts/report.md","mediaType":"text/markdown"}],"minCitations":5,"github":false}}

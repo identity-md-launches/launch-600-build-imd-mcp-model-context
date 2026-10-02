@@ -22,13 +22,18 @@ the API server submits and pays gas for the onchain settlement.
 | `imd_check` | `POST /requests/check` — the evaluator's verdict, retried up to 3× (it is noisy) | free |
 | `imd_import_repo` | `POST /requests/import` — public GitHub repo → `repoUrl` + `baseCommit` | free |
 | `imd_quote` | Quote only: `POST /requests/quote` + the 402 challenge → returns price and order id | free |
-| `imd_pay` | Pays a quoted order. Needs `confirm: true`, honours `IMD_DRY_RUN` and the spend caps | 0.5 IMD |
+| `imd_pay` | Pays a quoted order. Needs `confirm: true`, honours `IMD_DRY_RUN` and the spend caps | 0.5 IMD (× runs for schedules) |
 | `imd_order_status` | `GET /requests/{id}` | free |
 | `imd_job` | `GET /jobs/{id}` (+ `report: true` also fetches `/jobs/{id}/report.md`) | free |
 | `imd_schedules` | `GET /schedules?owner=` — list one owner's schedules | free |
 
-Paid-action input schemas are derived at runtime from `GET /openapi.json`
-`x-imd-actions`, so new actions appear without a release.
+Paid actions are read at runtime from `GET /openapi.json` `x-imd-actions`
+(an array keyed by `.action`: `job.open`, `job.continue`, `launch.open`,
+`oracle.request`, `workflow.open`, `schedule.create`, `schedule.topup`), so new
+actions appear without a release. The live API advertises no per-action input
+schema, so `imd_quote` passes `input` through: use `imd_check` (free) first, and
+the server's `422 invalid_input` problems are returned as-is. Input shapes are
+documented at <https://imd.fun/docs#paid>.
 
 ## Run it
 
@@ -37,17 +42,16 @@ Requires Node 20+.
 Straight from GitHub:
 
 ```sh
-npx -y github:<owner>/imd-mcp
+npx -y github:identity-md-launches/launch-600-build-imd-mcp-model-context
 ```
 
-(replace `<owner>` with the GitHub user or org hosting this repo). The `prepare`
-script compiles the TypeScript on install and the `imd-mcp` bin starts the
+The `prepare` script compiles the TypeScript on install and the `imd-mcp` bin starts the
 stdio server.
 
 Or from a clone:
 
 ```sh
-git clone <this-repo> && cd imd-mcp
+git clone https://github.com/identity-md-launches/launch-600-build-imd-mcp-model-context.git && cd launch-600-build-imd-mcp-model-context
 npm ci            # prepare runs `npm run build` automatically
 node dist/src/index.js        # or: npm start
 ```
@@ -63,7 +67,7 @@ Read-only (no key — `imd_pay` will refuse):
   "mcpServers": {
     "imd": {
       "command": "npx",
-      "args": ["-y", "github:<owner>/imd-mcp"]
+      "args": ["-y", "github:identity-md-launches/launch-600-build-imd-mcp-model-context"]
     }
   }
 }
@@ -76,7 +80,7 @@ With a wallet:
   "mcpServers": {
     "imd": {
       "command": "npx",
-      "args": ["-y", "github:<owner>/imd-mcp"],
+      "args": ["-y", "github:identity-md-launches/launch-600-build-imd-mcp-model-context"],
       "env": {
         "IMD_PRIVATE_KEY": "0x…",
         "IMD_MAX_PER_REQUEST": "1",
@@ -91,11 +95,11 @@ With a wallet:
 ### Claude Code
 
 ```sh
-claude mcp add imd -- npx -y github:<owner>/imd-mcp
+claude mcp add imd -- npx -y github:identity-md-launches/launch-600-build-imd-mcp-model-context
 # or with env vars:
 claude mcp add imd \
   -e IMD_PRIVATE_KEY=0x… -e IMD_DRY_RUN=false \
-  -- npx -y github:<owner>/imd-mcp
+  -- npx -y github:identity-md-launches/launch-600-build-imd-mcp-model-context
 ```
 
 ### Claude Desktop
@@ -108,7 +112,7 @@ Edit `claude_desktop_config.json`
   "mcpServers": {
     "imd": {
       "command": "npx",
-      "args": ["-y", "github:<owner>/imd-mcp"],
+      "args": ["-y", "github:identity-md-launches/launch-600-build-imd-mcp-model-context"],
       "env": { "IMD_DRY_RUN": "true" }
     }
   }
@@ -124,7 +128,7 @@ Settings → MCP → "New MCP server" writes `~/.cursor/mcp.json`:
   "mcpServers": {
     "imd": {
       "command": "npx",
-      "args": ["-y", "github:<owner>/imd-mcp"],
+      "args": ["-y", "github:identity-md-launches/launch-600-build-imd-mcp-model-context"],
       "env": { "IMD_DRY_RUN": "true" }
     }
   }
@@ -132,7 +136,7 @@ Settings → MCP → "New MCP server" writes `~/.cursor/mcp.json`:
 ```
 
 Any of these can also point at a local checkout with
-`"command": "node", "args": ["/path/to/imd-mcp/dist/src/index.js"]`.
+`"command": "node", "args": ["/path/to/launch-600-build-imd-mcp-model-context/dist/src/index.js"]`.
 
 ## Environment
 
@@ -155,9 +159,14 @@ Any of these can also point at a local checkout with
   ledger. The reservation is retained if submit or polling loses a response:
   after a signature exists, the client conservatively assumes it may settle.
   This ledger is keyed by the public address and contains no private key.
-- The 402 challenge is refused if `accepts[0]` or the quote disagree with
-  `GET /requests/capabilities` on asset, payTo or amount — this blocks
-  look-alike address poisoning. We never pay more than the quoted amount.
+- The 402 challenge is refused if `accepts[0]` or the quote disagree with the
+  `GET /requests/capabilities` `actions[]` entry for the quoted action on
+  asset, payTo or amount — this blocks look-alike address poisoning. The
+  expected amount is that entry's `payment.amount`, or `payment.amount × runs`
+  (runs from the quoted input) for actions `pricedPer` `"run"`
+  (`schedule.create`, `schedule.topup`). We never pay more than the quoted
+  amount, and the caps apply to that total: with the default
+  `IMD_MAX_PER_REQUEST=1`, a schedule of more than 2 runs is refused.
 
 ## Paid-request flow (what `imd_pay` does)
 
@@ -181,6 +190,9 @@ npm test   # builds, then runs the full quote → 402 → sign → submit → po
 ```
 
 Tests never spend real IMD and never touch mainnet — they run against
-`tests/mock-server.ts`.
+`tests/mock-server.ts`, which serves the bodies of `GET /requests/capabilities`,
+`GET /openapi.json` and two free `POST /requests/check` calls saved from the
+live API under `fixtures/live/`. `tests/live.test.ts` checks the client against
+those saved bodies.
 
 Commissioned through paid IMD swarm requests.

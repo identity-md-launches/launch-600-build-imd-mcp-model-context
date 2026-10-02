@@ -29,9 +29,10 @@ export interface ToolContext {
 }
 
 /**
- * Validate a paid action's input against the JSON schema advertised in
- * GET /openapi.json x-imd-actions. Unknown/invalid schemas are a pass-through —
- * the server's 422 invalid_input response is authoritative.
+ * Check a paid action against GET /openapi.json x-imd-actions. The live API
+ * advertises no per-action input schema, so input is passed through; if a
+ * schema ever appears it is applied. The server's 422 invalid_input response
+ * (and the free imd_check verdict) is authoritative.
  */
 async function validateActionInput(
   ctx: ToolContext,
@@ -121,7 +122,10 @@ export function createHandlers(ctx: ToolContext) {
         });
       } catch (e) {
         if (e instanceof ApiError && e.status === 422) {
-          return err(`invalid_input: ${JSON.stringify((e.body as { problems?: unknown })?.problems ?? e.body)}`);
+          return err(
+            `invalid_input: ${JSON.stringify((e.body as { problems?: unknown })?.problems ?? e.body)} ` +
+              "(imd_check gives the free evaluator verdict for this action and input)",
+          );
         }
         return fail(e);
       }
@@ -225,11 +229,12 @@ export function registerTools(server: McpServer, handlers: Handlers): void {
       title: "IMD quote",
       description:
         `${NOTICE} Quote a paid action only — creates the order and returns the price ` +
-        "and order id. Nothing is paid. Input schemas are derived from the server's " +
-        "x-imd-actions at runtime, so new actions work without upgrading this package.",
+        "and order id. Nothing is paid. Actions come from the server's x-imd-actions at " +
+        "runtime, so new actions work without upgrading this package. Input is passed " +
+        "through; run imd_check first, and the server's 422 problems are returned as-is.",
       inputSchema: {
         action: z.string().describe("Paid action name from imd_capabilities"),
-        input: z.record(z.unknown()).describe("Action input, validated against the advertised schema"),
+        input: z.record(z.unknown()).describe("Action input, validated by the server"),
       },
     },
     async (args) => handlers.imd_quote(args),
