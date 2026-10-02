@@ -188,7 +188,14 @@ export async function signPayment(
   challenge: Challenge,
   verified: VerifiedPayment,
 ): Promise<SignResult> {
-  const account = privateKeyToAccount(privateKey);
+  let account: ReturnType<typeof privateKeyToAccount>;
+  try {
+    account = privateKeyToAccount(privateKey);
+  } catch {
+    // Never propagate a crypto-library validation message: some implementations
+    // include the supplied private scalar in it.
+    throw new PaymentRefusal("configured private key is invalid");
+  }
   const deadline = verified.expiresAtSec - 5n; // at most expiresAt minus 5s
   const nonce = BigInt(randomNonce());
 
@@ -265,7 +272,19 @@ export async function payOrder(
 
   const current = await client.getRequest(orderId);
   const status = String(current.status ?? "");
-  if (status && !["quoted", "payment_pending"].includes(status)) {
+  if (["payment_pending", "admission_pending"].includes(status)) {
+    // This state means a payment has already been submitted. Poll it rather
+    // than create a fresh Permit2 nonce/signature on a retry.
+    const final = await client.pollRequest(orderId, poll);
+    return {
+      orderId,
+      dryRun: false,
+      paid: true,
+      final,
+      message: `order is already '${status}' — polled its existing payment; final status ${String(final.status ?? "?")}`,
+    };
+  }
+  if (status && status !== "quoted") {
     return {
       orderId,
       dryRun: false,
@@ -286,14 +305,6 @@ export async function payOrder(
       `${amountImd} IMD exceeds the per-request cap IMD_MAX_PER_REQUEST=${formatUnits(cfg.maxPerRequestWei, IMD_DECIMALS)}`,
     );
   }
-  const today = tracker.spentToday();
-  if (today + verified.amountWei > cfg.maxPerDayWei) {
-    throw new PaymentRefusal(
-      `${amountImd} IMD would exceed the per-day cap IMD_MAX_PER_DAY=${formatUnits(cfg.maxPerDayWei, IMD_DECIMALS)} ` +
-        `(${formatUnits(today, IMD_DECIMALS)} already spent today)`,
-    );
-  }
-
   if (cfg.dryRun) {
     return {
       orderId,
@@ -309,9 +320,25 @@ export async function payOrder(
     };
   }
 
+  // This durable reservation is intentionally made immediately before signing,
+  // not after submit. If the server accepts a payment but the response is lost,
+  // the authorization remains counted for the day rather than enabling a
+  // second spend. reserve() is atomic across local MCP processes.
+  const reservation = await tracker.reserve(orderId, verified.amountWei, cfg.maxPerDayWei);
+  if (reservation.state === "cap_exceeded") {
+    throw new PaymentRefusal(
+      `${amountImd} IMD would exceed the per-day cap IMD_MAX_PER_DAY=${formatUnits(cfg.maxPerDayWei, IMD_DECIMALS)} ` +
+        `(${formatUnits(reservation.spentBefore, IMD_DECIMALS)} already reserved today)`,
+    );
+  }
+  if (reservation.state === "existing") {
+    throw new PaymentRefusal(
+      "this order already has a locally reserved payment authorization; refusing to sign it again",
+    );
+  }
+
   const signed = await signPayment(cfg.privateKey, challenge, verified);
   const submit = await client.submitPayment(orderId, signed.payment, signed.quoteSignature);
-  tracker.add(verified.amountWei);
 
   const final = await client.pollRequest(orderId, poll);
   return {

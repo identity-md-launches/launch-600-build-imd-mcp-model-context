@@ -140,7 +140,7 @@ Any of these can also point at a local checkout with
 |---|---|---|
 | `IMD_PRIVATE_KEY` | unset | `0x` key used to sign. Unset → every tool is read-only. |
 | `IMD_MAX_PER_REQUEST` | `1` | Per-request cap, in IMD. |
-| `IMD_MAX_PER_DAY` | `5` | Per-UTC-day cap, in IMD (per process; resets on restart). |
+| `IMD_MAX_PER_DAY` | `5` | Per-UTC-day cap, in IMD. Paid servers retain reservations per wallet across restarts. |
 | `IMD_DRY_RUN` | `true` | When true, `imd_pay` verifies the quote then stops before signing. |
 | `IMD_API_BASE` | `https://api.imd.fun` | API base URL — only for tests/mocks. |
 
@@ -151,6 +151,10 @@ Any of these can also point at a local checkout with
 - **Dry run is the default.** Real payment needs `IMD_DRY_RUN=false` *and*
   `confirm: true` on the `imd_pay` call.
 - Per-request and per-day caps are enforced **before** any signature is made.
+- Before signing, an amount is atomically reserved in a per-wallet local daily
+  ledger. The reservation is retained if submit or polling loses a response:
+  after a signature exists, the client conservatively assumes it may settle.
+  This ledger is keyed by the public address and contains no private key.
 - The 402 challenge is refused if `accepts[0]` or the quote disagree with
   `GET /requests/capabilities` on asset, payTo or amount — this blocks
   look-alike address poisoning. We never pay more than the quoted amount.

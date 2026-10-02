@@ -30,6 +30,8 @@ export interface MockOptions {
   checkFailures?: number;
   /** Number of pending poll responses before an order completes. */
   pendingPolls?: number;
+  /** Accept the first signed payment, then drop its response (simulates a lost TCP response). */
+  dropFirstPaymentResponse?: boolean;
 }
 
 export interface Submission {
@@ -96,6 +98,7 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
   let checkFailsLeft = opts.checkFailures ?? 0;
   const pendingPolls = opts.pendingPolls ?? 1;
   let orderSeq = 0;
+  let dropPaymentResponse = opts.dropFirstPaymentResponse ?? false;
 
   const send = (res: http.ServerResponse, status: number, body: unknown, type = "application/json") => {
     const text = typeof body === "string" ? body : JSON.stringify(body);
@@ -248,6 +251,13 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
           quoteSignature: body.quoteSignature,
           paymentSignatureHeader: psHeader,
         });
+        if (dropPaymentResponse) {
+          dropPaymentResponse = false;
+          // The server accepted the authorization, but the client cannot know
+          // whether it did when the connection disappears before a response.
+          req.socket.destroy();
+          return;
+        }
         return send(res, 202, { id: order.id, status: order.status });
       }
 

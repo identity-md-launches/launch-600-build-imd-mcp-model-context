@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { privateKeyToAccount } from "viem/accounts";
 import { EXPERIMENTAL_NOTICE, SpendTracker, loadConfig } from "./config.js";
 import { ImdClient } from "./api.js";
 import { createHandlers, registerTools } from "./tools.js";
@@ -28,7 +29,8 @@ Environment (the only configuration):
   IMD_API_BASE         API base URL (default: https://api.imd.fun; testing only).
 
 Safety: the key is read only from the environment and is never logged, printed,
-written to disk or sent anywhere except inside signatures.
+written to disk or sent anywhere except inside signatures. Paid servers keep a
+per-wallet daily authorization ledger in the local user state directory.
 `;
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -43,7 +45,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   const cfg = loadConfig();
   const client = new ImdClient(cfg.baseUrl);
-  const tracker = new SpendTracker();
+  // The ledger is keyed by the public address only; the private key is never
+  // persisted. It survives restarts so a second MCP client cannot reset caps.
+  const tracker = new SpendTracker({
+    wallet: cfg.privateKey ? privateKeyToAccount(cfg.privateKey).address : undefined,
+  });
   const handlers = createHandlers({ client, cfg, tracker });
 
   const server = new McpServer(

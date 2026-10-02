@@ -1,10 +1,14 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseUnits } from "viem";
 import { ImdClient } from "../src/api.js";
 import { SpendTracker, loadConfig } from "../src/config.js";
+import { payOrder } from "../src/pay.js";
 import { MOCK_PRICE_WEI, startMock } from "./mock-server.js";
-import { TEST_KEY, handlersOf, makeCtx, resultJson, resultText } from "./helpers.js";
+import { TEST_ADDRESS, TEST_KEY, handlersOf, makeCtx, resultJson, resultText } from "./helpers.js";
 
 const INPUT = { repoUrl: "https://github.com/example/repo", prompt: "fix the tests" };
 const EVIL = "0x000000000000000000000000000000000000dEaD";
@@ -156,6 +160,96 @@ describe("safety", () => {
     } finally {
       await mock.close();
     }
+  });
+
+  it("atomically reserves the daily cap for concurrent payments", async () => {
+    const mock = await startMock({ pendingPolls: 0 });
+    try {
+      const ctx = makeCtx(mock, { maxPerRequestWei: BigInt(MOCK_PRICE_WEI), maxPerDayWei: BigInt(MOCK_PRICE_WEI) });
+      const handlers = handlersOf(ctx);
+      const [first, second] = await Promise.all([quote(handlers), quote(handlers)]);
+      const results = await Promise.all([
+        handlers.imd_pay({ orderId: first, confirm: true }),
+        handlers.imd_pay({ orderId: second, confirm: true }),
+      ]);
+      assert.equal(results.filter((r) => !r.isError).length, 1);
+      assert.equal(results.filter((r) => r.isError).length, 1);
+      assert.match(resultText(results.find((r) => r.isError)!), /per-day cap/);
+      assert.equal(mock.submissions.length, 1);
+      assert.equal(ctx.tracker.spentToday(), BigInt(MOCK_PRICE_WEI));
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("keeps a pre-sign reservation when the accepted submit response is lost", async () => {
+    const mock = await startMock({ pendingPolls: 0, dropFirstPaymentResponse: true });
+    try {
+      const ctx = makeCtx(mock, { maxPerRequestWei: BigInt(MOCK_PRICE_WEI), maxPerDayWei: BigInt(MOCK_PRICE_WEI) });
+      const first = await ctx.client.quote("swarm.launch", INPUT);
+      await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, first, { intervalMs: 1, timeoutMs: 50 }));
+      assert.equal(mock.submissions.length, 1, "the mock accepted the authorization before disconnecting");
+      assert.equal(ctx.tracker.spentToday(), BigInt(MOCK_PRICE_WEI));
+
+      const second = await ctx.client.quote("swarm.launch", INPUT);
+      await assert.rejects(
+        () => payOrder(ctx.client, ctx.cfg, ctx.tracker, second, { intervalMs: 1, timeoutMs: 50 }),
+        /per-day cap/,
+      );
+      assert.equal(mock.submissions.length, 1);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("does not sign a second Permit2 authorization when a pending order is retried", async () => {
+    const mock = await startMock({ pendingPolls: 10_000 });
+    try {
+      const ctx = makeCtx(mock);
+      const orderId = await ctx.client.quote("swarm.launch", INPUT);
+      await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId, { intervalMs: 1, timeoutMs: 10 }));
+      assert.equal(mock.submissions.length, 1);
+      await assert.rejects(() => payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId, { intervalMs: 1, timeoutMs: 10 }));
+      assert.equal(mock.submissions.length, 1, "retry must poll, not sign a new nonce");
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("retains a wallet's cap when a new server tracker starts", async () => {
+    const mock = await startMock({ pendingPolls: 0 });
+    const stateDir = await mkdtemp(join(tmpdir(), "imd-mcp-ledger-"));
+    try {
+      const cap = BigInt(MOCK_PRICE_WEI);
+      const cfg = makeCtx(mock, { maxPerRequestWei: cap, maxPerDayWei: cap }).cfg;
+      const firstClient = new ImdClient(mock.url);
+      const firstTracker = new SpendTracker({ wallet: TEST_ADDRESS, storageDir: stateDir });
+      const first = await firstClient.quote("swarm.launch", INPUT);
+      await payOrder(firstClient, cfg, firstTracker, first, { intervalMs: 1, timeoutMs: 100 });
+
+      const secondClient = new ImdClient(mock.url);
+      const secondTracker = new SpendTracker({ wallet: TEST_ADDRESS, storageDir: stateDir });
+      assert.equal(secondTracker.spentToday(), cap, "new tracker reads the same wallet ledger");
+      const second = await secondClient.quote("swarm.launch", INPUT);
+      await assert.rejects(
+        () => payOrder(secondClient, cfg, secondTracker, second, { intervalMs: 1, timeoutMs: 100 }),
+        /per-day cap/,
+      );
+      assert.equal(mock.submissions.length, 1);
+    } finally {
+      await mock.close();
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an out-of-range private key without including it in the error", () => {
+    const key = `0x${"ff".repeat(32)}`;
+    assert.throws(() => loadConfig({ IMD_PRIVATE_KEY: key }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal(err.message, "IMD_PRIVATE_KEY is invalid");
+      assert.equal(err.message.includes(key), false);
+      return true;
+    });
   });
 
   it("retries the noisy evaluator up to 3 times", async () => {
