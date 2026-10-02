@@ -1,0 +1,329 @@
+import { formatUnits, getAddress, isAddress } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import {
+  CHAIN_ID,
+  Config,
+  IMD_ASSET,
+  IMD_DECIMALS,
+  PERMIT2,
+  SpendTracker,
+  X402_SPENDER,
+  parseImdAmount,
+} from "./config.js";
+import { Capabilities, Challenge, ImdClient } from "./api.js";
+import { asHex32, eqAddress, paymentHashOf, randomNonce, toEpochSeconds } from "./util.js";
+
+/** Thrown when a payment is refused by a local safety check. Never a network error. */
+export class PaymentRefusal extends Error {
+  constructor(message: string) {
+    super(`payment refused: ${message}`);
+    this.name = "PaymentRefusal";
+  }
+}
+
+const PERMIT_TYPES = {
+  TokenPermissions: [
+    { name: "token", type: "address" },
+    { name: "amount", type: "uint256" },
+  ],
+  PermitWitnessTransferFrom: [
+    { name: "permitted", type: "TokenPermissions" },
+    { name: "spender", type: "address" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" },
+    { name: "witness", type: "Witness" },
+  ],
+  Witness: [
+    { name: "to", type: "address" },
+    { name: "validAfter", type: "uint256" },
+  ],
+} as const;
+
+const QUOTE_APPROVAL_TYPES = {
+  QuoteApproval: [
+    { name: "resource", type: "string" },
+    { name: "requesterScopeHash", type: "bytes32" },
+    { name: "quoteId", type: "string" },
+    { name: "quoteHash", type: "bytes32" },
+    { name: "paymentHash", type: "bytes32" },
+    { name: "action", type: "string" },
+    { name: "asset", type: "address" },
+    { name: "amount", type: "uint256" },
+    { name: "payTo", type: "address" },
+    { name: "expiresAt", type: "uint256" },
+  ],
+} as const;
+
+export interface VerifiedPayment {
+  asset: `0x${string}`;
+  amountWei: bigint;
+  payTo: `0x${string}`;
+  expiresAtSec: bigint;
+  accept: Record<string, unknown>;
+}
+
+export interface PayResult {
+  orderId: string;
+  dryRun: boolean;
+  paid: boolean;
+  amountImd?: string;
+  amountWei?: string;
+  payTo?: string;
+  quoteId?: string;
+  submitStatus?: number;
+  final?: Record<string, unknown>;
+  message: string;
+}
+
+/**
+ * Verify a 402 challenge against capabilities and its own quote.
+ * Refuses (throws PaymentRefusal) on any mismatch — this is what blocks
+ * look-alike asset/payTo poisoning and over-quotes.
+ */
+export function verifyChallenge(challenge: Challenge, caps: Capabilities): VerifiedPayment {
+  if (!challenge.accepts.length) {
+    throw new PaymentRefusal("challenge contains no accepts[] entries");
+  }
+  const accept = challenge.accepts[0];
+  const quote = challenge.quote;
+  const payment = quote.payment;
+
+  if (!quote.id || !quote.quoteHash || !quote.action) {
+    throw new PaymentRefusal("challenge quote is missing id, quoteHash or action");
+  }
+  for (const [field, v] of [
+    ["capabilities.asset", caps.asset],
+    ["capabilities.payTo", caps.payTo],
+    ["capabilities.price", caps.price],
+  ] as const) {
+    if (!v) throw new PaymentRefusal(`${field} is missing — cannot verify the challenge`);
+  }
+
+  // --- asset: challenge + quote + capabilities must all be the real IMD token ---
+  if (!eqAddress(payment.asset, IMD_ASSET)) {
+    throw new PaymentRefusal(`quote asset ${payment.asset} is not IMD (${IMD_ASSET})`);
+  }
+  if (!eqAddress(caps.asset, IMD_ASSET) || !eqAddress(caps.asset, payment.asset)) {
+    throw new PaymentRefusal(
+      `capabilities asset ${caps.asset} differs from the quoted asset ${payment.asset}`,
+    );
+  }
+  if (!eqAddress(accept.asset, payment.asset)) {
+    throw new PaymentRefusal(
+      `accepts[0].asset ${String(accept.asset)} differs from the quoted asset ${payment.asset}`,
+    );
+  }
+  if (!isAddress(payment.asset)) throw new PaymentRefusal(`asset ${payment.asset} is not an address`);
+
+  // --- payTo: quote + accepts[0] + capabilities must agree (anti-poisoning) ---
+  if (!caps.payTo || !isAddress(caps.payTo)) {
+    throw new PaymentRefusal(`capabilities payTo ${caps.payTo} is not an address`);
+  }
+  if (!eqAddress(payment.payTo, caps.payTo)) {
+    throw new PaymentRefusal(
+      `quote payTo ${payment.payTo} differs from capabilities payTo ${caps.payTo}`,
+    );
+  }
+  if (!eqAddress(accept.payTo, caps.payTo)) {
+    throw new PaymentRefusal(
+      `accepts[0].payTo ${String(accept.payTo)} differs from capabilities payTo ${caps.payTo}`,
+    );
+  }
+
+  // --- amount: identical everywhere, and never more than the standard price ---
+  let amountWei: bigint;
+  try {
+    amountWei = BigInt(payment.amount);
+  } catch {
+    throw new PaymentRefusal(`quoted amount ${payment.amount} is not an integer`);
+  }
+  if (amountWei <= 0n) throw new PaymentRefusal(`quoted amount ${payment.amount} is not positive`);
+  const acceptAmount = BigInt(String(accept.amount ?? "0"));
+  if (acceptAmount !== amountWei) {
+    throw new PaymentRefusal(
+      `accepts[0].amount ${String(accept.amount)} differs from the quoted amount ${payment.amount}`,
+    );
+  }
+  const capPriceWei = parseImdAmount(caps.price, caps.price ?? "0");
+  if (amountWei !== capPriceWei) {
+    throw new PaymentRefusal(
+      `quoted amount ${payment.amount} differs from capabilities price ${caps.price}`,
+    );
+  }
+
+  // --- accepts[0] sanity (x402 exact on mainnet) ---
+  if (accept.scheme !== undefined && accept.scheme !== "exact") {
+    throw new PaymentRefusal(`accepts[0].scheme ${String(accept.scheme)} is not "exact"`);
+  }
+  if (accept.network !== undefined) {
+    const ok = ["eip155:1", "ethereum", "mainnet", "1"].includes(String(accept.network).toLowerCase());
+    if (!ok) throw new PaymentRefusal(`accepts[0].network ${String(accept.network)} is not mainnet`);
+  }
+
+  // --- expiry: refuse stale quotes; deadline is expiresAt - 5s ---
+  const expiresAtSec = toEpochSeconds(quote.expiresAt, "quote.expiresAt");
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (expiresAtSec <= nowSec + 10n) {
+    throw new PaymentRefusal(`quote expiresAt ${String(quote.expiresAt)} has already expired`);
+  }
+
+  return {
+    asset: getAddress(payment.asset),
+    amountWei,
+    payTo: getAddress(caps.payTo!),
+    expiresAtSec,
+    accept,
+  };
+}
+
+export interface SignResult {
+  payment: Record<string, unknown>;
+  quoteSignature: string;
+  paymentHash: `0x${string}`;
+}
+
+/** Produce the x402 payment object and the QuoteApproval signature. */
+export async function signPayment(
+  privateKey: `0x${string}`,
+  challenge: Challenge,
+  verified: VerifiedPayment,
+): Promise<SignResult> {
+  const account = privateKeyToAccount(privateKey);
+  const deadline = verified.expiresAtSec - 5n; // at most expiresAt minus 5s
+  const nonce = BigInt(randomNonce());
+
+  const signature = await account.signTypedData({
+    domain: { name: "Permit2", chainId: CHAIN_ID, verifyingContract: PERMIT2 },
+    types: PERMIT_TYPES,
+    primaryType: "PermitWitnessTransferFrom",
+    message: {
+      permitted: { token: verified.asset, amount: verified.amountWei },
+      spender: X402_SPENDER,
+      nonce,
+      deadline,
+      witness: { to: verified.payTo, validAfter: 0n },
+    },
+  });
+
+  // Numbers as decimal strings, no extra fields — the server rejects extra fields.
+  const payment: Record<string, unknown> = {
+    x402Version: 2,
+    resource: challenge.resource,
+    accepted: verified.accept,
+    payload: {
+      signature,
+      permit2Authorization: {
+        from: account.address,
+        permitted: { token: verified.asset, amount: verified.amountWei.toString(10) },
+        spender: X402_SPENDER,
+        nonce: nonce.toString(10),
+        deadline: deadline.toString(10),
+        witness: { to: verified.payTo, validAfter: "0" },
+      },
+    },
+  };
+
+  const paymentHash = paymentHashOf(payment);
+  const quoteSignature = await account.signTypedData({
+    domain: { name: "IdentityMD Paid Action", version: "1", chainId: CHAIN_ID },
+    types: QUOTE_APPROVAL_TYPES,
+    primaryType: "QuoteApproval",
+    message: {
+      resource: challenge.resourceUrl,
+      requesterScopeHash: asHex32(challenge.requesterScopeHash, "requesterScopeHash"),
+      quoteId: challenge.quote.id,
+      quoteHash: asHex32(challenge.quote.quoteHash, "quote.quoteHash"),
+      paymentHash,
+      action: challenge.quote.action,
+      asset: verified.asset,
+      amount: verified.amountWei,
+      payTo: verified.payTo,
+      expiresAt: verified.expiresAtSec,
+    },
+  });
+
+  return { payment, quoteSignature, paymentHash };
+}
+
+/**
+ * Full paid-request flow for an already-quoted order:
+ * submit -> 402 challenge -> verify -> caps -> sign -> submit -> poll.
+ * Dry run stops after verification, before any signature.
+ */
+export async function payOrder(
+  client: ImdClient,
+  cfg: Config,
+  tracker: SpendTracker,
+  orderId: string,
+  poll: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<PayResult> {
+  if (!cfg.privateKey) {
+    throw new PaymentRefusal(
+      "IMD_PRIVATE_KEY is not set — this server is read-only and cannot pay",
+    );
+  }
+
+  const current = await client.getRequest(orderId);
+  const status = String(current.status ?? "");
+  if (status && !["quoted", "payment_pending"].includes(status)) {
+    return {
+      orderId,
+      dryRun: false,
+      paid: false,
+      final: current,
+      message: `order is already '${status}' — nothing to pay`,
+    };
+  }
+
+  const challenge = await client.getChallenge(orderId);
+  const caps = await client.capabilities();
+  const verified = verifyChallenge(challenge, caps);
+  const amountImd = formatUnits(verified.amountWei, IMD_DECIMALS);
+
+  // Spending caps are enforced before any signature exists.
+  if (verified.amountWei > cfg.maxPerRequestWei) {
+    throw new PaymentRefusal(
+      `${amountImd} IMD exceeds the per-request cap IMD_MAX_PER_REQUEST=${formatUnits(cfg.maxPerRequestWei, IMD_DECIMALS)}`,
+    );
+  }
+  const today = tracker.spentToday();
+  if (today + verified.amountWei > cfg.maxPerDayWei) {
+    throw new PaymentRefusal(
+      `${amountImd} IMD would exceed the per-day cap IMD_MAX_PER_DAY=${formatUnits(cfg.maxPerDayWei, IMD_DECIMALS)} ` +
+        `(${formatUnits(today, IMD_DECIMALS)} already spent today)`,
+    );
+  }
+
+  if (cfg.dryRun) {
+    return {
+      orderId,
+      dryRun: true,
+      paid: false,
+      amountImd,
+      amountWei: verified.amountWei.toString(10),
+      payTo: verified.payTo,
+      quoteId: challenge.quote.id,
+      message:
+        "dry run: verified the quote and stopped before signing. " +
+        "Set IMD_DRY_RUN=false and call imd_pay again with confirm: true to pay for real.",
+    };
+  }
+
+  const signed = await signPayment(cfg.privateKey, challenge, verified);
+  const submit = await client.submitPayment(orderId, signed.payment, signed.quoteSignature);
+  tracker.add(verified.amountWei);
+
+  const final = await client.pollRequest(orderId, poll);
+  return {
+    orderId,
+    dryRun: false,
+    paid: true,
+    amountImd,
+    amountWei: verified.amountWei.toString(10),
+    payTo: verified.payTo,
+    quoteId: challenge.quote.id,
+    submitStatus: submit.status,
+    final,
+    message: `paid ${amountImd} IMD for order ${orderId}; final status ${String(final.status ?? "?")}`,
+  };
+}
