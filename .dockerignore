@@ -1,0 +1,9 @@
+# Allow only the inputs needed by npm ci and TypeScript.
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!tests/
+!tests/**

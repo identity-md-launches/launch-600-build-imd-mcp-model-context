@@ -1,0 +1,50 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.identity-md-launches/imd-mcp",
+  "description": "Experimental MCP server to hire the IMD swarm with quotes, capped payments, and job status.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/identity-md-launches/launch-600-build-imd-mcp-model-context",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "imd-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "IMD_PRIVATE_KEY",
+          "description": "Optional 0x signing key; unset keeps tools read-only.",
+          "isSecret": true
+        },
+        {
+          "name": "IMD_MAX_PER_REQUEST",
+          "description": "Per-request spending cap in IMD.",
+          "default": "1",
+          "format": "number"
+        },
+        {
+          "name": "IMD_MAX_PER_DAY",
+          "description": "Per-UTC-day spending cap in IMD.",
+          "default": "5",
+          "format": "number"
+        },
+        {
+          "name": "IMD_DRY_RUN",
+          "description": "Verify quotes without signing when true.",
+          "default": "true",
+          "format": "boolean"
+        },
+        {
+          "name": "IMD_API_BASE",
+          "description": "API base URL; override only for tests or mocks.",
+          "default": "https://api.imd.fun"
+        }
+      ]
+    }
+  ]
+}

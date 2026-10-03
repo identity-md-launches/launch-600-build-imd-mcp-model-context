@@ -3,11 +3,20 @@
 > **Experimental, commissioned as a test of the IMD swarm. It may not work as
 > described. Read the code, start with small amounts, no warranty.**
 
+## 2026-10-03 — MCP directory preparation
+
+Added official MCP Registry metadata, Glama maintainer metadata, a non-root
+Node slim Docker image definition, and owner publishing instructions. Recorded
+the real-payment verification of commit `865972d`. No server behavior changed.
+
 ## Unreleased — payment window fix
 
 Checked `https://api.imd.fun` on 2026-10-03 with read-only GETs, a free
 `POST /requests/check`, and a free `job.open` quote and 402 challenge. The
-live responses used are in `fixtures/live/`; no payment was submitted.
+live responses used are in `fixtures/live/`; no payment was submitted during
+those checks. Later verified with a real paid `job.open` through `imd_pay` on
+Ethereum mainnet on 2026-10-03 at commit `865972d`: order
+`03fab9a5-30a2-49e4-9f70-455211d87d8f`, submit 202, admitted.
 
 1. **Permit2 deadline.** The signed deadline is now the earlier of five
    seconds before quote expiry and five seconds before the challenge's

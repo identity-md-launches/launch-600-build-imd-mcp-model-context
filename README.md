@@ -3,6 +3,8 @@
 > **Experimental, commissioned as a test of the IMD swarm. It may not work as
 > described. Read the code, start with small amounts, no warranty.**
 
+A real paid `job.open` was opened through `imd_pay` on Ethereum mainnet on 2026-10-03 (order `03fab9a5-30a2-49e4-9f70-455211d87d8f`, submit 202, admitted) at commit `865972d`.
+
 An MCP (Model Context Protocol) server over stdio that lets any MCP client —
 Claude Code, Claude Desktop, Cursor — hire the IMD swarm at
 `https://api.imd.fun`. Paid actions are settled with the x402 / Permit2 flow:
@@ -183,6 +185,8 @@ Any of these can also point at a local checkout with
 6. Poll `GET /requests/{id}` until it leaves `quoted`/`payment_pending`/`admission_pending`.
 
 ## Development
+
+See [Publishing](docs/PUBLISHING.md) for the repository owner’s npm and MCP directory publishing steps.
 
 ```sh
 npm test   # builds, then runs the full quote → 402 → sign → submit → poll
