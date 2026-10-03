@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { parseUnits } from "viem";
 import { Challenge, normaliseActions, parseCapabilities } from "../src/api.js";
 import { IMD_ASSET } from "../src/config.js";
-import { PaymentRefusal, payOrder, verifyChallenge } from "../src/pay.js";
+import { PaymentRefusal, payOrder, signPayment, verifyChallenge } from "../src/pay.js";
 import { LIVE_CAPABILITIES, LIVE_OPENAPI, liveFixture, startMock } from "./mock-server.js";
-import { handlersOf, makeCtx, resultJson, resultText } from "./helpers.js";
+import { TEST_KEY, handlersOf, makeCtx, resultJson, resultText } from "./helpers.js";
 
 /**
  * Bodies saved from the live API (fixtures/live/): GET /requests/capabilities,
@@ -45,6 +45,25 @@ function challengeFor(action: string, amount: string, input: unknown): Challenge
 }
 
 describe("live API shapes", () => {
+  it("signs within the saved live 402 challenge's maxTimeoutSeconds", async () => {
+    const challenge = liveFixture<Challenge & { quote: Challenge["quote"] & { issuedAt: number } }>(
+      "challenge-job.open.response.json",
+    );
+    const nowSec = challenge.quote.issuedAt + 1;
+    const realNow = Date.now;
+    Date.now = () => nowSec * 1000;
+    try {
+      const verified = verifyChallenge(challenge, parseCapabilities(LIVE_CAPABILITIES));
+      const signed = await signPayment(TEST_KEY, challenge, verified);
+      const auth = (signed.payment.payload as { permit2Authorization: { deadline: string } }).permit2Authorization;
+      assert.equal(challenge.accepts[0].maxTimeoutSeconds, 300);
+      assert.ok(BigInt(auth.deadline) <= BigInt(nowSec + Number(challenge.accepts[0].maxTimeoutSeconds)));
+      assert.ok(BigInt(auth.deadline) < BigInt(challenge.quote.expiresAt as number) - 5n);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   it("capabilities() parses the live body with per-action asset, payTo and amount", () => {
     const caps = parseCapabilities(LIVE_CAPABILITIES);
     assert.deepEqual(Object.keys(caps.actions).sort(), [...LIVE_ACTIONS].sort());

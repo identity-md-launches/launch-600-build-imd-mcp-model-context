@@ -3,6 +3,26 @@
 > **Experimental, commissioned as a test of the IMD swarm. It may not work as
 > described. Read the code, start with small amounts, no warranty.**
 
+## Unreleased — payment window fix
+
+Checked `https://api.imd.fun` on 2026-10-03 with read-only GETs, a free
+`POST /requests/check`, and a free `job.open` quote and 402 challenge. The
+live responses used are in `fixtures/live/`; no payment was submitted.
+
+1. **Permit2 deadline.** The signed deadline is now the earlier of five
+   seconds before quote expiry and five seconds before the challenge's
+   `accepts[0].maxTimeoutSeconds` window ends. Missing, invalid, or too-short
+   windows raise `PaymentRefusal` before the daily spend reservation.
+2. **Mock payment window.** The mock now uses a 600-second quote lifetime and
+   returns HTTP 400 `invalid_payment_window` for a Permit2 deadline beyond
+   its 300-second maximum. Tests reject the old roughly 595-second deadline
+   and accept a real `payOrder` signature.
+3. **Live challenge test.** A fresh 402 body is saved as
+   `fixtures/live/challenge-job.open.response.json`. A unit test signs its
+   terms and checks the deadline against `maxTimeoutSeconds`.
+4. **Submit errors.** A 4xx submit response now includes the server's error
+   code explicitly in the `imd_pay` message.
+
 ## Unreleased — work against the live IMD API
 
 Checked against `https://api.imd.fun` on 2026-10-02 with read-only GETs and

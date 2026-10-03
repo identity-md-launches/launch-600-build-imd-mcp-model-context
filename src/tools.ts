@@ -141,6 +141,10 @@ export function createHandlers(ctx: ToolContext) {
       try {
         return ok(await payOrder(ctx.client, ctx.cfg, ctx.tracker, args.orderId));
       } catch (e) {
+        if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.path.endsWith("/submit")) {
+          const code = (e.body as { error?: unknown } | null)?.error;
+          if (typeof code === "string") return err(`${e.message}; server error code: ${code}`);
+        }
         return fail(e);
       }
     },

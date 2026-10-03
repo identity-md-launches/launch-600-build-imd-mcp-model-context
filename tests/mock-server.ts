@@ -38,6 +38,7 @@ export interface ChallengeOverrides {
   amount?: string;
   scheme?: string;
   network?: string;
+  maxTimeoutSeconds?: unknown;
 }
 
 export interface MockOptions {
@@ -133,7 +134,7 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
     const asset = ov.asset ?? MOCK_ASSET;
     const payTo = ov.payTo ?? MOCK_PAYTO;
     const amount = ov.amount ?? liveAmount(order.action, order.input);
-    const expiresAt = new Date(Date.now() + 300_000).toISOString();
+    const expiresAt = new Date(Date.now() + 600_000).toISOString();
     return {
       x402Version: 2,
       accepts: [
@@ -143,7 +144,7 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
           asset,
           amount,
           payTo,
-          maxTimeoutSeconds: 300,
+          maxTimeoutSeconds: "maxTimeoutSeconds" in ov ? ov.maxTimeoutSeconds : 300,
         },
       ],
       quote: {
@@ -257,6 +258,17 @@ export async function startMock(opts: MockOptions = {}): Promise<MockServer> {
           typeof body.quoteSignature !== "string"
         ) {
           return send(res, 402, { error: "invalid_payment_shape" });
+        }
+        const accepted = (challenges.get(order.id)?.accepts as Record<string, unknown>[] | undefined)?.[0];
+        if (typeof auth.deadline !== "string" || !/^\d+$/.test(auth.deadline)) {
+          return send(res, 402, { error: "invalid_payment_shape" });
+        }
+        const maxTimeoutSeconds = accepted?.maxTimeoutSeconds;
+        if (typeof maxTimeoutSeconds !== "number" || !Number.isSafeInteger(maxTimeoutSeconds) || maxTimeoutSeconds <= 0) {
+          return send(res, 400, { error: "invalid_payment_window" });
+        }
+        if (BigInt(auth.deadline) > BigInt(Math.floor(Date.now() / 1000) + maxTimeoutSeconds)) {
+          return send(res, 400, { error: "invalid_payment_window" });
         }
         order.paid = true;
         order.status = "admission_pending";

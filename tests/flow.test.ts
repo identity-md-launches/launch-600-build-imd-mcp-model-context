@@ -5,7 +5,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { X402_SPENDER } from "../src/config.js";
-import { payOrder } from "../src/pay.js";
+import { ApiError } from "../src/api.js";
+import { payOrder, signPayment, verifyChallenge } from "../src/pay.js";
 import { paymentHashOf, sortedJsonStringify, toEpochSeconds } from "../src/util.js";
 import { registerTools } from "../src/tools.js";
 import {
@@ -18,6 +19,7 @@ import {
 } from "./mock-server.js";
 import {
   TEST_ADDRESS,
+  TEST_KEY,
   handlersOf,
   makeCtx,
   resultJson,
@@ -85,7 +87,8 @@ describe("full paid-request path", () => {
     assert.equal(auth.spender, X402_SPENDER);
     assert.match(auth.nonce, /^\d+$/);
     const expiresAtSec = toEpochSeconds(quoteData.expiresAt, "expiresAt");
-    assert.equal(BigInt(auth.deadline), expiresAtSec - 5n);
+    assert.ok(BigInt(auth.deadline) <= expiresAtSec - 5n);
+    assert.ok(BigInt(auth.deadline) <= BigInt(Math.floor(Date.now() / 1000) + Number(accept.maxTimeoutSeconds)));
     assert.equal(auth.witness.to.toLowerCase(), MOCK_PAYTO.toLowerCase());
     assert.equal(auth.witness.validAfter, "0");
 
@@ -162,6 +165,28 @@ describe("full paid-request path", () => {
       signature: sub.quoteSignature as `0x${string}`,
     });
     assert.ok(quoteSigOk, "QuoteApproval signature must recover to the payer key");
+  });
+
+  it("mock refuses a signed deadline about 595 seconds ahead", async () => {
+    const server = await startMock();
+    try {
+      const ctx = makeCtx(server);
+      const orderId = await ctx.client.quote("job.open", QUOTE_INPUT);
+      const challenge = await ctx.client.getChallenge(orderId);
+      assert.equal(challenge.accepts[0].maxTimeoutSeconds, 300);
+      const verified = verifyChallenge(challenge, await ctx.client.capabilities());
+      const lateDeadline = verified.expiresAtSec - 5n;
+      assert.ok(lateDeadline > BigInt(Math.floor(Date.now() / 1000) + 300));
+      const signed = await signPayment(TEST_KEY, challenge, { ...verified, deadlineSec: lateDeadline });
+      await assert.rejects(
+        () => ctx.client.submitPayment(orderId, signed.payment, signed.quoteSignature),
+        (e: unknown) => e instanceof ApiError && e.status === 400 &&
+          (e.body as { error?: string }).error === "invalid_payment_window",
+      );
+      assert.equal(server.submissions.length, 0);
+    } finally {
+      await server.close();
+    }
   });
 
   it("records spend against the per-day tracker", async () => {

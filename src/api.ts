@@ -44,8 +44,12 @@ export interface Capabilities {
   raw: unknown;
 }
 
+export interface ChallengeAccept extends Record<string, unknown> {
+  maxTimeoutSeconds?: unknown;
+}
+
 export interface Challenge {
-  accepts: Record<string, unknown>[];
+  accepts: ChallengeAccept[];
   quote: {
     id: string;
     quoteHash: string;
@@ -181,7 +185,7 @@ export class ImdClient {
     const quote = o.quote as Record<string, unknown> | undefined;
     const payment = (quote?.payment ?? {}) as Record<string, unknown>;
     const challenge: Challenge = {
-      accepts: Array.isArray(o.accepts) ? (o.accepts as Record<string, unknown>[]) : [],
+      accepts: Array.isArray(o.accepts) ? (o.accepts as ChallengeAccept[]) : [],
       quote: {
         id: str(quote?.id) ?? "",
         quoteHash: str(quote?.quoteHash) ?? str(quote?.quote_hash) ?? "",

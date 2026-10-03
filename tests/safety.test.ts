@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseUnits } from "viem";
-import { ImdClient } from "../src/api.js";
+import { ApiError, ImdClient } from "../src/api.js";
 import { SpendTracker, loadConfig } from "../src/config.js";
 import { payOrder } from "../src/pay.js";
 import { MOCK_PRICE_WEI, liveFixture, startMock } from "./mock-server.js";
@@ -137,6 +137,40 @@ describe("safety", () => {
       assert.equal(res.isError, true);
       assert.match(resultText(res), /per-request cap/);
       assert.equal(mock.submissions.length, 0);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("refuses missing, invalid and too-short payment windows before reserving spend", async () => {
+    for (const maxTimeoutSeconds of [undefined, 0, -1, 2.5, "300", 5]) {
+      const mock = await startMock({ challenge: { maxTimeoutSeconds } });
+      try {
+        const ctx = makeCtx(mock);
+        const orderId = await ctx.client.quote("job.open", INPUT);
+        await assert.rejects(
+          () => payOrder(ctx.client, ctx.cfg, ctx.tracker, orderId),
+          /payment refused: .*(maxTimeoutSeconds|no future Permit2 deadline)/,
+        );
+        assert.equal(ctx.tracker.spentToday(), 0n);
+        assert.equal(mock.submissions.length, 0);
+      } finally {
+        await mock.close();
+      }
+    }
+  });
+
+  it("includes a submit 4xx error code in the imd_pay message", async () => {
+    const mock = await startMock();
+    try {
+      const ctx = makeCtx(mock);
+      const orderId = await ctx.client.quote("job.open", INPUT);
+      ctx.client.submitPayment = async () => {
+        throw new ApiError(400, `/requests/${orderId}/submit`, { error: "invalid_payment_window" });
+      };
+      const res = await handlersOf(ctx).imd_pay({ orderId, confirm: true });
+      assert.equal(res.isError, true);
+      assert.match(resultText(res), /server error code: invalid_payment_window/);
     } finally {
       await mock.close();
     }

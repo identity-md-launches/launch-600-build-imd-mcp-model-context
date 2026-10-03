@@ -58,6 +58,7 @@ export interface VerifiedPayment {
   amountWei: bigint;
   payTo: `0x${string}`;
   expiresAtSec: bigint;
+  deadlineSec: bigint;
   accept: Record<string, unknown>;
 }
 
@@ -190,11 +191,21 @@ export function verifyChallenge(challenge: Challenge, capabilities: Capabilities
     if (!ok) throw new PaymentRefusal(`accepts[0].network ${String(accept.network)} is not mainnet`);
   }
 
-  // --- expiry: refuse stale quotes; deadline is expiresAt - 5s ---
+  // --- expiry: respect both the quote and the accepted payment window ---
   const expiresAtSec = toEpochSeconds(quote.expiresAt, "quote.expiresAt");
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   if (expiresAtSec <= nowSec + 10n) {
     throw new PaymentRefusal(`quote expiresAt ${String(quote.expiresAt)} has already expired`);
+  }
+  const maxTimeoutSeconds = accept.maxTimeoutSeconds;
+  if (typeof maxTimeoutSeconds !== "number" || !Number.isSafeInteger(maxTimeoutSeconds) || maxTimeoutSeconds <= 0) {
+    throw new PaymentRefusal("accepts[0].maxTimeoutSeconds must be a positive integer");
+  }
+  const maxDeadlineSec = nowSec + BigInt(maxTimeoutSeconds) - 5n;
+  const quoteDeadlineSec = expiresAtSec - 5n;
+  const deadlineSec = quoteDeadlineSec < maxDeadlineSec ? quoteDeadlineSec : maxDeadlineSec;
+  if (deadlineSec <= nowSec) {
+    throw new PaymentRefusal("accepted payment window leaves no future Permit2 deadline");
   }
 
   return {
@@ -202,6 +213,7 @@ export function verifyChallenge(challenge: Challenge, capabilities: Capabilities
     amountWei,
     payTo: getAddress(caps.payTo!),
     expiresAtSec,
+    deadlineSec,
     accept,
   };
 }
@@ -226,7 +238,7 @@ export async function signPayment(
     // include the supplied private scalar in it.
     throw new PaymentRefusal("configured private key is invalid");
   }
-  const deadline = verified.expiresAtSec - 5n; // at most expiresAt minus 5s
+  const deadline = verified.deadlineSec;
   const nonce = BigInt(randomNonce());
 
   const signature = await account.signTypedData({
